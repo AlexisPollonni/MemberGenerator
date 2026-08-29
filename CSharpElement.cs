@@ -17,7 +17,7 @@ public record CSharpElement(ISymbol Symbol)
 
     public string FileNameString(SymbolDisplayFormat? format = null)
     {
-        var sb = new StringBuilder(Symbol.ToDisplayString(format));
+        var sb = new StringBuilder(Symbol.MetadataName);
         foreach (var c in Path.GetInvalidFileNameChars())
             sb.Replace(c, '_');
         sb.Append(".g.cs");
