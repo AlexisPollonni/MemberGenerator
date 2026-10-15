@@ -11,255 +11,217 @@ using Microsoft.CodeAnalysis.Text;
 
 namespace MemberGenerator;
 
-[Generator]
-public class MemberGenerator : IIncrementalGenerator
+[Generator(LanguageNames.CSharp)]
+public class DefaultMemberGenerator : IIncrementalGenerator
 {
-    const string Namespace     = "MemberGenerator";
-    const string AttributeName = "GenerateDefaultMembers";
+    private const string AttributeSource =
+        @"
+namespace MemberGenerator
+{
+    [System.AttributeUsage(System.AttributeTargets.Class | System.AttributeTargets.Struct, Inherited = false, AllowMultiple = false)]
+    public sealed class GenerateDefaultMembersAttribute : System.Attribute { }
+}";
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        var codeUnits = GeneratePartialTypes(context);
-        context.RegisterPostInitializationOutput(EmitAttributes);
-        context.RegisterSourceOutput(codeUnits, EmitPartialTypes);
-    }
-
-    static IncrementalValueProvider<ImmutableArray<CodeUnit>> GeneratePartialTypes(
-        IncrementalGeneratorInitializationContext context)
-    {
-        var annotatedInterfaces = context.SyntaxProvider.ForAttributeWithMetadataName(
-                $"{Namespace}.{AttributeName}Attribute",
-                static (s, _) => s is InterfaceDeclarationSyntax,
-                static (c, _) =>
-                {
-                    if (c.TargetSymbol is not INamedTypeSymbol interfaceSymbol)
-                    {
-                        Console.WriteLine($"TargetSymbol is not INamedTypeSymbol: {c.TargetSymbol}");
-                        return null;
-                    }
-
-                    CSharpInterface cSharpInterface = new CSharpInterface(interfaceSymbol)
-                    {
-                        Syntaxes = interfaceSymbol.DeclaringSyntaxReferences
-                            .Select(x => x.GetSyntax())
-                            .OfType<InterfaceDeclarationSyntax>()
-                            .ToReadonlyList()
-                    };
-
-                    return (CSharpType)cSharpInterface;
-                })
-            .Where(static state => state != null)
-            .Collect()
-            .Select(static (state, _) => state.OfType<CSharpType>()
-                .ToImmutableHashSet(CSharpEqualityComparer.Instance)
-            );
-
-        var allPartialTypes = context.SyntaxProvider
-            .CreateSyntaxProvider(
-                static (syntax, _) => syntax is TypeDeclarationSyntax declaration
-                                      && declaration.IsPartial()
-                                      && declaration.HasBaseList(),
-                static (context, cancellationToken) =>
-                {
-                    ISymbol? symbol = context.SemanticModel.GetDeclaredSymbol(context.Node, cancellationToken);
-                    if (symbol is not INamedTypeSymbol typeSymbol)
-                    {
-                        Console.WriteLine($"TypeDeclarationSyntax is not INamedTypeSymbol: {context.Node}");
-                        return null;
-                    }
-
-                    var type = new CSharpType(typeSymbol)
-                    {
-                        Syntaxes = typeSymbol.DeclaringSyntaxReferences
-                            .Select(x => x.GetSyntax())
-                            .OfType<TypeDeclarationSyntax>()
-                            .ToReadonlyList()
-                    };
-                    return type;
-                })
-            .Where(static typeSignature => typeSignature != null);
-
-        var partialTypes = allPartialTypes
-            .Combine(annotatedInterfaces)
-            .Select(static (state, cancellationToken) =>
-            {
-                var type = state.Left!;
-                var genericBaseTypes = type.Syntaxes.SelectMany(s => s.AncestorsAndSelf())
-                    .OfType<TypeDeclarationSyntax>()
-                    .SelectMany(t => t.BaseList?.Types.AsEnumerable() ?? [])
-                    .Where(b => b.Type is GenericNameSyntax)
-                    .ToArray();
-
-                var newType = type with { Members = ImmutableArray<CSharpMember>.Empty };
-                var genericMembersDictionary = state.Right;
-
-                var comparer = CSharpEqualityComparer.Instance;
-                var interfaceMap = new Dictionary<CSharpInterface, Dictionary<string, string>>(comparer);
-
-                foreach (var csInterface in type.AllInterfaces)
-                {
-                    var genericMap = new Dictionary<string, string>();
-                    foreach (var baseTypeSyntax in genericBaseTypes)
-                    {
-                        var generic = (GenericNameSyntax)baseTypeSyntax.Type;
-                        
-                        if (generic.Arity != csInterface.TypeParametersTypeSyntaxes.Length)
-                            continue;
-                        
-                        foreach (var interfaceType in csInterface.TypeParametersTypeSyntaxes)
-                        {
-                            string keyString = interfaceType.ToString();
-                            foreach (var baseArg in generic.TypeArgumentList.Arguments)
-                            {
-                                string valueString = baseArg.ToString();
-
-                                if (!genericMap.ContainsKey(keyString))
-                                    genericMap.Add(keyString, valueString);
-                            }
-                        }
-                    }
-
-                    if (!interfaceMap.ContainsKey(csInterface))
-                        interfaceMap.Add(csInterface, genericMap);
-                }
-
-                foreach (var csInterface in type.AllInterfaces)
-                {
-                    var genericMap = interfaceMap[csInterface];
-                    if (cancellationToken.IsCancellationRequested) break;
-
-                    if (genericMembersDictionary.Contains(csInterface))
-                    {
-                        var equalityComparer = CSharpEqualityComparer.Instance;
-
-                        var defaultMembers = csInterface.WithTypesQualified().Members
-                            .WithSyntaxWhere(MembersEx.HasBodyOrExpressionBody)
-                            .Select(c => c.GenericSubstitution(genericMap));
-
-                        var newMembers = defaultMembers.Except(type.Members, equalityComparer).ToImmutableArray();
-                        newType = newType with
-                        {
-                            Members = newType.Members.Length switch
-                            {
-                                0 => newMembers,
-                                _ => newType.Members.Union(newMembers, equalityComparer).ToImmutableArray()
-                            }
-                        };
-                    }
-                }
-
-                return newType;
-            }).Collect();
-
-        var codeUnits = partialTypes.Select(static (csTypes, _) =>
-        {
-            var sb = new StringBuilder();
-            var builder = ImmutableArray.CreateBuilder<CodeUnit>();
-            foreach (CSharpType csType in csTypes)
-                builder.Add(BuildCodeAndClear(sb, csType));
-            return builder.ToImmutable();
-        });
-        return codeUnits;
-    }
-
-    static void EmitPartialTypes(SourceProductionContext context, ImmutableArray<CodeUnit> codegen)
-    {
-        foreach (var (fileName, syntax) in codegen)
-        {
-            SourceText sourceCode = syntax.GetText(Encoding.UTF8);
-            context.AddSource(fileName, sourceCode);
-        }
-    }
-
-    static void EmitAttributes(IncrementalGeneratorPostInitializationContext ctx)
-    {
-        SourceText sourceCode = SourceText.From(
-            // language=C#
-            $$"""
-              // <auto-generated/>
-              namespace {{Namespace}}
-              {
-                  [System.AttributeUsage(System.AttributeTargets.Interface)]
-                  internal class {{AttributeName}}Attribute : System.Attribute
-                  {
-                  }
-              };
-              """, Encoding.UTF8
-        );
-        ctx.AddSource($"{AttributeName}Attribute.g.cs", sourceCode);
-    }
-
-    static CodeUnit BuildCodeAndClear(StringBuilder sb, CSharpType csType)
-    {
-        sb.Clear();
-        sb.AppendLine("// <auto-generated/>");
-        sb.AppendLine("#nullable enable");
-        sb.AppendLine("#pragma warning disable CS0109");
-
-        sb.AppendParentNamespace(csType.Symbol);
-        sb.AppendLine();
-
-        var usingNamespaces = csType.Members.SyntaxDeclarations()
-            .SelectMany(t => t.SyntaxTree.GetRoot().DescendantNodesAndSelf())
-            .OfType<UsingDirectiveSyntax>()
-            .OrderBy(_ => "global::")
-            .Distinct();
-
-        foreach (var usingNamespace in usingNamespaces)
-            sb.AppendLine(usingNamespace.ToString());
-
-        sb.AppendParentTypesBegin(csType.Symbol);
-        sb.AppendTypeIdentifierName(csType.Symbol);
-        sb.AppendLine("{");
-
-        var memberDisplayFormat = SymbolDisplayEx.IdentifierDisplayFormat.With(
-            propertyStyle: SymbolDisplayPropertyStyle.NameOnly,
-            memberOptions: SymbolDisplayMemberOptions.None
-                           | SymbolDisplayMemberOptions.IncludeParameters
-                           | SymbolDisplayMemberOptions.IncludeType
-                           | SymbolDisplayMemberOptions.IncludeRef
-                           | SymbolDisplayMemberOptions.IncludeExplicitInterface
-                           | SymbolDisplayMemberOptions.IncludeModifiers
-                           | SymbolDisplayMemberOptions.IncludeAccessibility
+        context.RegisterPostInitializationOutput(ctx =>
+            ctx.AddSource(
+                "GenerateDefaultMembersAttribute.g.cs",
+                SourceText.From(AttributeSource, Encoding.UTF8)
+            )
         );
 
-        foreach (var csMember in csType.Members)
+        var provider = context
+            .SyntaxProvider.ForAttributeWithMetadataName(
+                "MemberGenerator.GenerateDefaultMembersAttribute",
+                predicate: (node, _) =>
+                    node is StructDeclarationSyntax || node is ClassDeclarationSyntax,
+                transform: TransformTarget
+            )
+            .Where(m => m is null == false);
+
+        context.RegisterSourceOutput(provider, (spc, model) => Execute(spc, model!));
+    }
+
+    private static TargetModel? TransformTarget(
+        GeneratorAttributeSyntaxContext context,
+        System.Threading.CancellationToken token
+    )
+    {
+        if (context.TargetSymbol is not INamedTypeSymbol targetType)
+            return null;
+
+        var targetSyntax = (TypeDeclarationSyntax)context.TargetNode;
+        var generatedMembers = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
+        bool isStruct = targetType.TypeKind == TypeKind.Struct;
+
+        foreach (var iface in targetType.AllInterfaces)
         {
-            if (csMember.Syntaxes.FirstOrDefault() is null) continue;
-
-            if (csMember.Symbol is IMethodSymbol { IsAsync: true })
-                sb.Append("async ");
-
-            var isExplicitInterface =
-                csMember.Symbol
-                    is IMethodSymbol { ExplicitInterfaceImplementations.Length: > 0 }
-                    or IPropertySymbol { ExplicitInterfaceImplementations.Length: > 0 };
-
-            if (!isExplicitInterface)
-                sb.Append("public new ");
-
-            sb.AppendLine(csMember.Symbol.ToDisplayString(memberDisplayFormat));
-
-            sb.AppendLine();
-
-            if (csMember.Body is {} body)
+            foreach (var member in iface.GetMembers())
             {
-                sb.AppendLine(body.ToString());
-                if (body is ArrowExpressionClauseSyntax) sb.AppendLine(";");
+                token.ThrowIfCancellationRequested();
+
+                if (member is not IMethodSymbol and not IPropertySymbol)
+                    continue;
+                if (member is IMethodSymbol { AssociatedSymbol: not null })
+                    continue;
+                if (
+                    member is IMethodSymbol
+                    {
+                        MethodKind: MethodKind.ExplicitInterfaceImplementation
+                    }
+                )
+                    continue;
+                if (
+                    member is IPropertySymbol
+                    {
+                        ExplicitInterfaceImplementations: { IsEmpty: false }
+                    }
+                )
+                    continue;
+
+                // --- NEW: Skip static utilities ---
+                // Static methods in interfaces are only part of the contract if they are abstract or virtual.
+                if (member.IsStatic && !member.IsVirtual && !member.IsAbstract)
+                    continue;
+
+                var implementation = targetType.FindImplementationForInterfaceMember(member);
+
+                if (implementation == null)
+                {
+                    if (!member.IsAbstract)
+                        implementation = member;
+                    else
+                        continue;
+                }
+
+                if (
+                    SymbolEqualityComparer.Default.Equals(implementation.ContainingType, targetType)
+                )
+                    continue;
+                if (implementation.IsAbstract)
+                    continue;
+                if (implementation.IsSealed)
+                    continue;
+                if (implementation.DeclaringSyntaxReferences.IsEmpty)
+                    continue;
+                if (generatedMembers.ContainsKey(implementation))
+                    continue;
+
+                var syntaxRef = implementation.DeclaringSyntaxReferences[0];
+                var syntaxNode = syntaxRef.GetSyntax(token);
+
+                // Direct syntax check for 'sealed'
+                // Roslyn sometimes drops the IsSealed flag for static methods.
+                if (
+                    syntaxNode is MemberDeclarationSyntax memDecl
+                    && memDecl.Modifiers.Any(SyntaxKind.SealedKeyword)
+                )
+                    continue;
+
+                var semanticModel = context.SemanticModel.Compilation.GetSemanticModel(
+                    syntaxRef.SyntaxTree
+                );
+
+                var implInterface = implementation.ContainingType;
+                var typeMap = new Dictionary<ITypeSymbol, ITypeSymbol>(
+                    SymbolEqualityComparer.Default
+                );
+                for (int i = 0; i < implInterface.TypeArguments.Length; i++)
+                {
+                    typeMap[implInterface.OriginalDefinition.TypeParameters[i]] =
+                        implInterface.TypeArguments[i];
+                }
+
+                // Pass isStruct to the rewriter
+                var rewriter = new DimRewriter(semanticModel, typeMap, isStruct);
+                var rewrittenNode = rewriter.Visit(syntaxNode);
+
+                generatedMembers.Add(implementation, rewrittenNode.ToFullString());
             }
+        }
 
+        if (generatedMembers.Count == 0)
+            return null;
+
+        return new TargetModel(
+            targetType.ContainingNamespace.IsGlobalNamespace
+                ? null
+                : targetType.ContainingNamespace.ToDisplayString(),
+            targetType.Name,
+            targetSyntax.Keyword.ValueText,
+            targetType.TypeParameters.IsDefaultOrEmpty
+                ? ""
+                : $"<{string.Join(", ", targetType.TypeParameters.Select(t => t.Name))}>",
+            generatedMembers.Values.ToImmutableArray()
+        );
+    }
+
+    private static void Execute(SourceProductionContext context, TargetModel model)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("// <auto-generated/>");
+
+        if (model.Namespace != null)
+        {
+            sb.AppendLine($"namespace {model.Namespace}");
+            sb.AppendLine("{");
+        }
+
+        sb.AppendLine($"    partial {model.TypeKind} {model.Name}{model.Generics}");
+        sb.AppendLine("    {");
+
+        foreach (var member in model.GeneratedMembers)
+        {
+            sb.AppendLine(member);
             sb.AppendLine();
         }
 
-        sb.AppendLine();
-        sb.AppendParentTypesEnd(csType.Symbol);
-        sb.AppendLine("}");
-        sb.AppendLine("#pragma warning restore CS0109");
-        string fileName = csType.FileNameString(SymbolDisplayFormat.MinimallyQualifiedFormat);
-        var tree = CSharpSyntaxTree.ParseText(sb.ToString());
-        var root = tree.GetRoot().NormalizeWhitespace();
-        return new CodeUnit(fileName, root);
+        sb.AppendLine("    }");
+
+        if (model.Namespace != null)
+        {
+            sb.AppendLine("}");
+        }
+
+        context.AddSource(
+            $"{model.Name}.DefaultMembers.g.cs",
+            SourceText.From(sb.ToString(), Encoding.UTF8)
+        );
     }
 }
 
-internal record struct CodeUnit(string Filename, SyntaxNode Code);
+internal record TargetModel(
+    string? Namespace,
+    string Name,
+    string TypeKind,
+    string Generics,
+    ImmutableArray<string> GeneratedMembers
+)
+{
+    public virtual bool Equals(TargetModel? other)
+    {
+        if (other is null)
+            return false;
+        return Namespace == other.Namespace
+            && Name == other.Name
+            && TypeKind == other.TypeKind
+            && Generics == other.Generics
+            && GeneratedMembers.SequenceEqual(other.GeneratedMembers);
+    }
+
+    public override int GetHashCode()
+    {
+        unchecked
+        {
+            int hash = 17;
+            hash = hash * 31 + (Namespace?.GetHashCode() ?? 0);
+            hash = hash * 31 + Name.GetHashCode();
+            hash = hash * 31 + TypeKind.GetHashCode();
+            hash = hash * 31 + Generics.GetHashCode();
+            foreach (var member in GeneratedMembers)
+                hash = hash * 31 + member.GetHashCode();
+            return hash;
+        }
+    }
+}

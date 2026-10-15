@@ -37,16 +37,24 @@ public record CSharpMember(ISymbol Symbol) : CSharpElement(Symbol)
 
     public CSharpSyntaxNode? Body
     {
-        get => _body ??= Syntaxes.Select(memberDeclarationSyntax => memberDeclarationSyntax switch
-        {
-            MethodDeclarationSyntax { Body: {} body } => body,
-            MethodDeclarationSyntax { ExpressionBody: {} expressionBody } => expressionBody,
-            PropertyDeclarationSyntax { ExpressionBody: {} expressionBody } => expressionBody,
-            PropertyDeclarationSyntax { AccessorList: {} accessors } => accessors,
-            IndexerDeclarationSyntax { ExpressionBody: {} expressionBody } => expressionBody,
-            IndexerDeclarationSyntax { AccessorList: {} accessorList } => accessorList,
-            _ => (CSharpSyntaxNode?)null,
-        }).FirstOrDefault(cSharpSyntaxNode => cSharpSyntaxNode != null);
+        get =>
+            _body ??= Syntaxes
+                .Select(memberDeclarationSyntax =>
+                    memberDeclarationSyntax switch
+                    {
+                        MethodDeclarationSyntax { Body: { } body } => body,
+                        MethodDeclarationSyntax { ExpressionBody: { } expressionBody } =>
+                            expressionBody,
+                        PropertyDeclarationSyntax { ExpressionBody: { } expressionBody } =>
+                            expressionBody,
+                        PropertyDeclarationSyntax { AccessorList: { } accessors } => accessors,
+                        IndexerDeclarationSyntax { ExpressionBody: { } expressionBody } =>
+                            expressionBody,
+                        IndexerDeclarationSyntax { AccessorList: { } accessorList } => accessorList,
+                        _ => (CSharpSyntaxNode?)null,
+                    }
+                )
+                .FirstOrDefault(cSharpSyntaxNode => cSharpSyntaxNode != null);
         init => _body = value;
     }
 }
@@ -61,41 +69,52 @@ public record CSharpType(INamedTypeSymbol Symbol) : CSharpMember(Symbol)
         init => base.Syntaxes = value;
     }
 
-    ImmutableArray<CSharpMember>?    _members;
+    ImmutableArray<CSharpMember>? _members;
     ImmutableArray<CSharpInterface>? _interfaces;
     ImmutableArray<CSharpInterface>? _allInterfaces;
-    ImmutableArray<TypeSyntax>?      _typeParameters;
+    ImmutableArray<TypeSyntax>? _typeParameters;
 
-    public ImmutableArray<CSharpInterface> AllInterfaces => _allInterfaces ??=
-        Symbol.AllInterfaces.Select(i => new CSharpInterface(i)
-        {
-            Syntaxes = i.DeclaringSyntaxReferences
-                .Select(x => x.GetSyntax())
-                .OfType<InterfaceDeclarationSyntax>().ToReadonlyList()
-        }).ToImmutableArray();
+    public ImmutableArray<CSharpInterface> AllInterfaces =>
+        _allInterfaces ??= Symbol
+            .AllInterfaces.Select(i => new CSharpInterface(i)
+            {
+                Syntaxes = i
+                    .DeclaringSyntaxReferences.Select(x => x.GetSyntax())
+                    .OfType<InterfaceDeclarationSyntax>()
+                    .ToReadonlyList(),
+            })
+            .ToImmutableArray();
 
-    public ImmutableArray<CSharpInterface> Interfaces => _interfaces ??=
-        Symbol.Interfaces.Select(i => new CSharpInterface(i)
-        {
-            Syntaxes = i.DeclaringSyntaxReferences
-                .Select(x => x.GetSyntax())
-                .OfType<InterfaceDeclarationSyntax>().ToReadonlyList()
-        }).ToImmutableArray();
+    public ImmutableArray<CSharpInterface> Interfaces =>
+        _interfaces ??= Symbol
+            .Interfaces.Select(i => new CSharpInterface(i)
+            {
+                Syntaxes = i
+                    .DeclaringSyntaxReferences.Select(x => x.GetSyntax())
+                    .OfType<InterfaceDeclarationSyntax>()
+                    .ToReadonlyList(),
+            })
+            .ToImmutableArray();
 
-    public ImmutableArray<TypeSyntax> TypeParametersTypeSyntaxes => _typeParameters ??=
-        Syntaxes.SelectMany(x => x.TypeParameterList?.Parameters ?? [])
+    public ImmutableArray<TypeSyntax> TypeParametersTypeSyntaxes =>
+        _typeParameters ??= Syntaxes
+            .SelectMany(x => x.TypeParameterList?.Parameters ?? [])
             .Select(x => SyntaxFactory.ParseTypeName(x.Identifier.Text))
             .ToImmutableArray();
 
     public ImmutableArray<CSharpMember> Members
     {
-        get => _members ??= Symbol.GetMembers()
-            .Select(m => new CSharpMember(m)
-            {
-                Syntaxes = m.DeclaringSyntaxReferences.Select(x => x.GetSyntax())
-                    .OfType<MemberDeclarationSyntax>().ToReadonlyList()
-            })
-            .ToImmutableArray();
+        get =>
+            _members ??= Symbol
+                .GetMembers()
+                .Select(m => new CSharpMember(m)
+                {
+                    Syntaxes = m
+                        .DeclaringSyntaxReferences.Select(x => x.GetSyntax())
+                        .OfType<MemberDeclarationSyntax>()
+                        .ToReadonlyList(),
+                })
+                .ToImmutableArray();
         init => _members = value;
     }
 }
@@ -117,7 +136,7 @@ public class CSharpEqualityComparer : IEqualityComparer<ISymbol>, IEqualityCompa
         typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
         genericsOptions: SymbolDisplayGenericsOptions.None,
         memberOptions: SymbolDisplayMemberOptions.IncludeParameters
-                       | SymbolDisplayMemberOptions.IncludeExplicitInterface,
+            | SymbolDisplayMemberOptions.IncludeExplicitInterface,
         parameterOptions: SymbolDisplayParameterOptions.IncludeType
     );
     public static CSharpEqualityComparer Instance { get; } = new();
@@ -135,7 +154,8 @@ public class CSharpEqualityComparer : IEqualityComparer<ISymbol>, IEqualityCompa
             {
                 equals &= xMethod.Parameters.Length == yMethod.Parameters.Length;
                 equals &= xMethod.TypeArguments.Length == yMethod.TypeArguments.Length;
-                equals &= xMethod.Parameters.Select(p => p.RefKind)
+                equals &= xMethod
+                    .Parameters.Select(p => p.RefKind)
                     .SequenceEqual(yMethod.Parameters.Select(p => p.RefKind));
             }
 
@@ -175,7 +195,7 @@ public class CSharpEqualityComparer : IEqualityComparer<ISymbol>, IEqualityCompa
     {
         unchecked
         {
-            hash = (hash*397) ^ value?.GetHashCode() ?? 0;
+            hash = (hash * 397) ^ value?.GetHashCode() ?? 0;
         }
 
         return hash;
