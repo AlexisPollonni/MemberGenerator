@@ -35,17 +35,20 @@ namespace MemberGenerator
             .SyntaxProvider.ForAttributeWithMetadataName(
                 "MemberGenerator.GenerateDefaultMembersAttribute",
                 predicate: (node, _) =>
-                    node is StructDeclarationSyntax || node is ClassDeclarationSyntax,
+                    node
+                        is StructDeclarationSyntax
+                            or ClassDeclarationSyntax
+                            or RecordDeclarationSyntax,
                 transform: TransformTarget
             )
-            .Where(m => m is null == false);
+            .Where(m => m is not null);
 
         context.RegisterSourceOutput(provider, (spc, model) => Execute(spc, model!));
     }
 
     private static TargetModel? TransformTarget(
         GeneratorAttributeSyntaxContext context,
-        System.Threading.CancellationToken token
+        CancellationToken token
     )
     {
         if (context.TargetSymbol is not INamedTypeSymbol targetType)
@@ -53,103 +56,87 @@ namespace MemberGenerator
 
         var targetSyntax = (TypeDeclarationSyntax)context.TargetNode;
         var generatedMembers = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
-        bool isStruct = targetType.TypeKind == TypeKind.Struct;
+        var isStruct = targetType.TypeKind == TypeKind.Struct;
 
-        foreach (var iface in targetType.AllInterfaces)
+        foreach (var member in targetType.AllInterfaces.SelectMany(iface => iface.GetMembers()))
         {
-            foreach (var member in iface.GetMembers())
+            token.ThrowIfCancellationRequested();
+
+            if (member is not IMethodSymbol and not IPropertySymbol)
+                continue;
+            switch (member)
             {
-                token.ThrowIfCancellationRequested();
-
-                if (member is not IMethodSymbol and not IPropertySymbol)
+                case IMethodSymbol { AssociatedSymbol: not null }:
+                case IMethodSymbol { MethodKind: MethodKind.ExplicitInterfaceImplementation }:
+                case IPropertySymbol { ExplicitInterfaceImplementations: { IsEmpty: false } }:
                     continue;
-                if (member is IMethodSymbol { AssociatedSymbol: not null })
-                    continue;
-                if (
-                    member is IMethodSymbol
-                    {
-                        MethodKind: MethodKind.ExplicitInterfaceImplementation
-                    }
-                )
-                    continue;
-                if (
-                    member is IPropertySymbol
-                    {
-                        ExplicitInterfaceImplementations: { IsEmpty: false }
-                    }
-                )
-                    continue;
-
-                // --- NEW: Skip static utilities ---
-                // Static methods in interfaces are only part of the contract if they are abstract or virtual.
-                if (member.IsStatic && !member.IsVirtual && !member.IsAbstract)
-                    continue;
-
-                var implementation = targetType.FindImplementationForInterfaceMember(member);
-
-                if (implementation == null)
-                {
-                    if (!member.IsAbstract)
-                        implementation = member;
-                    else
-                        continue;
-                }
-
-                if (
-                    SymbolEqualityComparer.Default.Equals(implementation.ContainingType, targetType)
-                )
-                    continue;
-                if (implementation.IsAbstract)
-                    continue;
-                if (implementation.IsSealed)
-                    continue;
-                if (implementation.DeclaringSyntaxReferences.IsEmpty)
-                    continue;
-                if (generatedMembers.ContainsKey(implementation))
-                    continue;
-
-                var syntaxRef = implementation.DeclaringSyntaxReferences[0];
-                var syntaxNode = syntaxRef.GetSyntax(token);
-
-                // Direct syntax check for 'sealed'
-                // Roslyn sometimes drops the IsSealed flag for static methods.
-                if (
-                    syntaxNode is MemberDeclarationSyntax memDecl
-                    && memDecl.Modifiers.Any(SyntaxKind.SealedKeyword)
-                )
-                    continue;
-
-                var semanticModel = context.SemanticModel.Compilation.GetSemanticModel(
-                    syntaxRef.SyntaxTree
-                );
-
-                var implInterface = implementation.ContainingType;
-                var typeMap = new Dictionary<ITypeSymbol, ITypeSymbol>(
-                    SymbolEqualityComparer.Default
-                );
-                for (int i = 0; i < implInterface.TypeArguments.Length; i++)
-                {
-                    typeMap[implInterface.OriginalDefinition.TypeParameters[i]] =
-                        implInterface.TypeArguments[i];
-                }
-
-                // Pass isStruct to the rewriter
-                var rewriter = new DimRewriter(semanticModel, typeMap, isStruct);
-                var rewrittenNode = rewriter.Visit(syntaxNode);
-
-                generatedMembers.Add(implementation, rewrittenNode.ToFullString());
             }
+
+            // --- NEW: Skip static utilities ---
+            // Static methods in interfaces are only part of the contract if they are abstract or virtual.
+            if (member.IsStatic && !member.IsVirtual && !member.IsAbstract)
+                continue;
+
+            var implementation = targetType.FindImplementationForInterfaceMember(member);
+
+            if (implementation == null)
+            {
+                if (!member.IsAbstract)
+                    implementation = member;
+                else
+                    continue;
+            }
+
+            if (SymbolEqualityComparer.Default.Equals(implementation.ContainingType, targetType))
+                continue;
+            if (implementation.IsAbstract)
+                continue;
+            if (implementation.IsSealed)
+                continue;
+            if (implementation.DeclaringSyntaxReferences.IsEmpty)
+                continue;
+            if (generatedMembers.ContainsKey(implementation))
+                continue;
+
+            var syntaxRef = implementation.DeclaringSyntaxReferences[0];
+            var syntaxNode = syntaxRef.GetSyntax(token);
+
+            // Direct syntax check for 'sealed'
+            // Roslyn sometimes drops the IsSealed flag for static methods.
+            if (
+                syntaxNode is MemberDeclarationSyntax memDecl
+                && memDecl.Modifiers.Any(SyntaxKind.SealedKeyword)
+            )
+                continue;
+
+            var semanticModel = context.SemanticModel.Compilation.GetSemanticModel(
+                syntaxRef.SyntaxTree
+            );
+
+            var implInterface = implementation.ContainingType;
+            var typeMap = new Dictionary<ITypeSymbol, ITypeSymbol>(SymbolEqualityComparer.Default);
+            for (var i = 0; i < implInterface.TypeArguments.Length; i++)
+            {
+                typeMap[implInterface.OriginalDefinition.TypeParameters[i]] =
+                    implInterface.TypeArguments[i];
+            }
+
+            // Pass isStruct to the rewriter
+            var rewriter = new DimRewriter(semanticModel, typeMap, isStruct);
+            var rewrittenNode = rewriter.Visit(syntaxNode);
+
+            generatedMembers.Add(implementation, rewrittenNode.ToFullString());
         }
 
         if (generatedMembers.Count == 0)
             return null;
 
-        return new TargetModel(
+        return new(
             targetType.ContainingNamespace.IsGlobalNamespace
                 ? null
                 : targetType.ContainingNamespace.ToDisplayString(),
             targetType.Name,
-            targetSyntax.Keyword.ValueText,
+            GetMirrorKeywords(targetSyntax).ToString(),
             targetType.TypeParameters.IsDefaultOrEmpty
                 ? ""
                 : $"<{string.Join(", ", targetType.TypeParameters.Select(t => t.Name))}>",
@@ -168,7 +155,7 @@ namespace MemberGenerator
             sb.AppendLine("{");
         }
 
-        sb.AppendLine($"    partial {model.TypeKind} {model.Name}{model.Generics}");
+        sb.AppendLine($"    {model.TypeKind} {model.Name}{model.Generics}");
         sb.AppendLine("    {");
 
         foreach (var member in model.GeneratedMembers)
@@ -188,6 +175,28 @@ namespace MemberGenerator
             $"{model.Name}.DefaultMembers.g.cs",
             SourceText.From(sb.ToString(), Encoding.UTF8)
         );
+    }
+
+    private static SyntaxTokenList GetMirrorKeywords(TypeDeclarationSyntax originalType)
+    {
+        // 1. Start with the core modifiers (e.g., public, readonly, partial, static, internal)
+        var tokens = new List<SyntaxToken>(originalType.Modifiers);
+
+        // 2. If it's a record, append the "record" and "struct/class" context keywords
+        if (originalType is not RecordDeclarationSyntax recordDecl)
+            return SyntaxFactory.TokenList(tokens).Add(originalType.Keyword);
+
+        if (!recordDecl.Keyword.IsKind(SyntaxKind.None))
+        {
+            tokens.Add(recordDecl.Keyword);
+        }
+
+        if (!recordDecl.ClassOrStructKeyword.IsKind(SyntaxKind.None))
+        {
+            tokens.Add(recordDecl.ClassOrStructKeyword);
+        }
+
+        return SyntaxFactory.TokenList(tokens);
     }
 }
 
